@@ -1,4 +1,10 @@
-# Техническа Документация
+# MТехническа Документация
+
+## Разпределение на пиновете на LiDAR конектора
+
+![LiDAR Pinout](https://github.com/pav2000/LidarStm32f103/blob/main/lidar.jpg?raw=true)
+
+*Изображение: [pav2000/LidarStm32f103](https://github.com/pav2000/LidarStm32f103)*
 
 ---
 
