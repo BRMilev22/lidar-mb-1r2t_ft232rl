@@ -1,13 +1,26 @@
 # Техническа Документация
 
 <p align="center">
-  <img src="radar_logo.png" alt="LiDAR Map Лого" width="200">
+  <img src="images/radar_logo.png" alt="LiDAR Map Лого" width="200">
 </p>
 
 <p align="center">
   <em>2D и 3D визуализация на LiDAR данни в реално време за сензор MB-1R2T</em><br>
   <sub>Лого от <a href="https://github.com/PRPetkov22">PRPetkov22</a></sub>
 </p>
+
+<table align="center">
+  <tr>
+    <td align="center">
+      <img src="images/app2d.png" alt="2D визуализация" width="420"><br>
+      <b>2D Радарен изглед</b>
+    </td>
+    <td align="center">
+      <img src="images/app3d.png" alt="3D визуализация" width="420"><br>
+      <b>3D Перспективен изглед</b>
+    </td>
+  </tr>
+</table>
 
 ---
 

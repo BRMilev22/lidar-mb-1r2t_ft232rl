@@ -1,13 +1,26 @@
 # Technical Documentation
 
 <p align="center">
-  <img src="radar_logo.png" alt="LiDAR Map Logo" width="200">
+  <img src="images/radar_logo.png" alt="LiDAR Map Logo" width="200">
 </p>
 
 <p align="center">
   <em>Real-time 2D & 3D LiDAR visualization for the MB-1R2T sensor</em><br>
   <sub>Logo by <a href="https://github.com/PRPetkov22">PRPetkov22</a></sub>
 </p>
+
+<table align="center">
+  <tr>
+    <td align="center">
+      <img src="images/app2d.png" alt="2D Visualization" width="420"><br>
+      <b>2D Radar View</b>
+    </td>
+    <td align="center">
+      <img src="images/app3d.png" alt="3D Visualization" width="420"><br>
+      <b>3D Perspective View</b>
+    </td>
+  </tr>
+</table>
 
 ---
 
