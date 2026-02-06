@@ -597,30 +597,28 @@ Factors affecting quality:
 
 ### Recommended Filtering Strategy
 
+**Important discovery:** Through reverse-engineering, we found that the MB-1R2T sensor
+interleaves valid and invalid readings. Every other measurement has quality=1 with
+distance values of 64000-65240mm — these are "no return" sentinel values, NOT real
+measurements. The original threshold of `distance < 60000` was **incorrect** and allowed
+these garbage readings through, causing scattered noise dots in visualization.
+
+The correct thresholds are:
+- **Quality >= 10** (not 5 — values 1-9 are almost always invalid)
+- **Distance < 16000mm** (not 60000 — the sensor's real max range is ~12m)
+- **Distance > 50mm** (minimum reliable range)
+
 ```python
+MIN_QUALITY = 10
+INVALID_DISTANCE = 16000
+
 def is_valid_measurement(quality, distance):
-    """
-    Filter invalid LiDAR measurements
-    
-    Returns True if measurement should be used
-    """
-    # Reject very low quality (noise)
-    if quality <= 5:
+    if quality < MIN_QUALITY:
         return False
-    
-    # Reject "no return" distances
-    if distance >= 60000:  # 60+ meters
+    if distance >= INVALID_DISTANCE:
         return False
-    
-    # Reject zero distance (too close)
-    if distance == 0:
+    if distance <= 50:
         return False
-    
-    # Optional: Reject suspiciously high quality at long range
-    # (might be cross-talk or interference)
-    if distance > 10000 and quality > 200:
-        return False  # 10m with max quality is suspicious
-    
     return True
 ```
 
@@ -674,87 +672,84 @@ Each packet (▓▓):
 
 ## Software Implementation
 
-### Reading Data (Python)
+The visualizer (`lidar_map.py`) uses **Pygame** for real-time rendering. Previous attempts
+with PyQtGraph/OpenGL had performance issues (freezing, buffer overflows) and the line
+rendering created "spider-web" artifacts connecting distant points through the center.
 
-```python
-import serial
+### Architecture
 
-# Open serial port
-ser = serial.Serial(
-    port='/dev/cu.usbserial-A5069RR4',  # macOS
-    # port='COM3',                       # Windows
-    baudrate=153600,
-    bytesize=serial.EIGHTBITS,
-    parity=serial.PARITY_NONE,
-    stopbits=serial.STOPBITS_ONE,
-    timeout=0  # Non-blocking
-)
-
-def parse_packet(buffer):
-    """
-    Parse a complete LiDAR packet from buffer
-    Returns list of (angle, distance, quality) tuples
-    """
-    points = []
-    
-    # Verify header
-    if buffer[0] != 0xAA or buffer[1] != 0x55:
-        return None
-    
-    # Extract packet info
-    packet_type = buffer[2]
-    num_measurements = buffer[3]
-    
-    # Decode angles (16-bit Little-Endian, value = degrees × 100)
-    start_angle = (buffer[4] | (buffer[5] << 8)) / 100.0
-    end_angle = (buffer[6] | (buffer[7] << 8)) / 100.0
-    
-    # Handle wraparound (e.g., 350° to 10°)
-    if end_angle < start_angle:
-        end_angle += 360.0
-    
-    # Calculate angle step
-    if num_measurements > 1:
-        angle_step = (end_angle - start_angle) / (num_measurements - 1)
-    else:
-        angle_step = 0
-    
-    # Parse each measurement
-    for i in range(num_measurements):
-        offset = 9 + i * 3
-        
-        quality = buffer[offset]
-        distance = buffer[offset + 1] | (buffer[offset + 2] << 8)
-        
-        # Filter invalid readings
-        if distance < 60000 and quality > 5:
-            angle = (start_angle + i * angle_step) % 360
-            points.append((angle, distance, quality))
-    
-    return points
+```
++-------------------------------------------------------+
+|  lidar_map.py                                         |
+|                                                       |
+|  +-------------+     +-----------------------------+  |
+|  | LidarSerial  |---->| LidarMap (Pygame renderer)  |  |
+|  |              |     |                             |  |
+|  | - Serial I/O |     | - 720-slot scan buffer      |  |
+|  | - Packet     |     | - Grid overlay              |  |
+|  |   parsing    |     | - Wall segment detection    |  |
+|  | - Buffer     |     | - Sweep line animation      |  |
+|  |   management |     | - HUD with live stats       |  |
+|  +-------------+     +-----------------------------+  |
++-------------------------------------------------------+
 ```
 
-### Packet Synchronization
+### Dependencies
+
+```
+pyserial    - Serial port communication
+pygame      - Real-time 2D rendering at 60 FPS
+```
+
+### Scan Buffer Design
+
+The scan buffer uses a 720-slot array (0.5 degree resolution per slot) that stores the
+latest measurement for each angle:
 
 ```python
-def find_packet_start(buffer):
-    """
-    Find the start of a valid packet in buffer
-    Returns index of packet start, or -1 if not found
-    """
-    for i in range(len(buffer) - 1):
-        if buffer[i] == 0xAA and buffer[i + 1] == 0x55:
-            # Verify we have enough bytes to read header
-            if i + 9 <= len(buffer):
-                num_measurements = buffer[i + 3]
-                packet_length = 9 + num_measurements * 3
-                
-                # Verify packet length is reasonable
-                if num_measurements <= 100:
-                    return i
-    
-    return -1
+SCAN_SIZE = 720
+scan_data = [None] * SCAN_SIZE
+
+idx = int(angle * 2) % SCAN_SIZE  # 45.5 degrees -> slot 91
 ```
+
+Each slot stores a tuple of `(distance_mm, quality, age)` where `age` tracks how many
+full rotations old the reading is. Points older than 3 scans are discarded, ensuring
+the display always reflects current surroundings.
+
+### Wall Segment Detection
+
+Walls are drawn by connecting adjacent points that are physically close to each other.
+The algorithm uses **pixel-space distance** to determine connectivity:
+
+```python
+for j in range(1, len(screen_points)):
+    sx1, sy1, _, idx1, _ = screen_points[j - 1]
+    sx2, sy2, _, idx2, _ = screen_points[j]
+
+    if idx2 - idx1 > 10:  # angle gap > 5 degrees -> break
+        continue
+
+    pixel_dist = math.sqrt((sx2-sx1)**2 + (sy2-sy1)**2)
+    if pixel_dist < max(30, 150 * zoom):
+        pygame.draw.line(screen, wall_color, (sx1,sy1), (sx2,sy2), 2)
+```
+
+This prevents the "spider-web" effect that occurred when connecting points by angle
+alone — two points at adjacent angles but vastly different distances would create
+lines through the center of the display.
+
+### Keyboard Controls
+
+| Key | Action |
+|-----|--------|
+| `+` / `=` | Zoom in (decrease range) |
+| `-` | Zoom out (increase range) |
+| `W` | Toggle wall rendering |
+| `G` | Toggle grid overlay |
+| `R` | Reset / clear scan data |
+| `F` | Toggle fullscreen |
+| `ESC` / `Q` | Quit |
 
 ---
 
