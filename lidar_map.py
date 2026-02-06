@@ -4,7 +4,16 @@ import platform as platform_mod
 import serial
 import serial.tools.list_ports
 import pygame
+from pygame.locals import *
 import time
+import numpy as np
+
+try:
+    from OpenGL.GL import *
+    from OpenGL.GLU import *
+    HAS_OPENGL = True
+except ImportError:
+    HAS_OPENGL = False
 
 BAUD_RATE = 153600
 SCAN_SIZE = 720
@@ -149,6 +158,225 @@ class LidarSerial:
             pass
 
 
+class Lidar3DView:
+    WALL_HEIGHT = 200.0
+    GROUND_SIZE = 15000.0
+    GROUND_GRID_STEP = 1000.0
+
+    def __init__(self, width, height):
+        self.width = width
+        self.height = height
+        self.cam_dist = 8000.0
+        self.cam_pitch = 35.0
+        self.cam_yaw = 45.0
+        self.cam_target = [0.0, 0.0, 0.0]
+        self._dragging = False
+        self._last_mouse = (0, 0)
+        self._panning = False
+
+    def init_gl(self, width, height):
+        self.width = width
+        self.height = height
+        glEnable(GL_DEPTH_TEST)
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        glEnable(GL_LINE_SMOOTH)
+        glHint(GL_LINE_SMOOTH_HINT, GL_NICEST)
+        glClearColor(0.06, 0.06, 0.08, 1.0)
+        self._setup_projection()
+
+    def _setup_projection(self):
+        glMatrixMode(GL_PROJECTION)
+        glLoadIdentity()
+        gluPerspective(50, self.width / max(1, self.height), 50, 50000)
+        glMatrixMode(GL_MODELVIEW)
+
+    def handle_event(self, event):
+        if event.type == MOUSEBUTTONDOWN:
+            if event.button == 1:
+                self._dragging = True
+                self._last_mouse = event.pos
+            elif event.button == 3:
+                self._panning = True
+                self._last_mouse = event.pos
+            elif event.button == 4:
+                self.cam_dist = max(1000, self.cam_dist - 500)
+            elif event.button == 5:
+                self.cam_dist = min(20000, self.cam_dist + 500)
+        elif event.type == MOUSEBUTTONUP:
+            if event.button == 1:
+                self._dragging = False
+            elif event.button == 3:
+                self._panning = False
+        elif event.type == MOUSEMOTION:
+            if self._dragging:
+                dx = event.pos[0] - self._last_mouse[0]
+                dy = event.pos[1] - self._last_mouse[1]
+                self.cam_yaw += dx * 0.4
+                self.cam_pitch = max(5, min(85, self.cam_pitch + dy * 0.4))
+                self._last_mouse = event.pos
+            elif self._panning:
+                dx = event.pos[0] - self._last_mouse[0]
+                dy = event.pos[1] - self._last_mouse[1]
+                yaw_rad = math.radians(self.cam_yaw)
+                self.cam_target[0] -= (math.cos(yaw_rad) * dx + math.sin(yaw_rad) * dy) * 5
+                self.cam_target[2] -= (-math.sin(yaw_rad) * dx + math.cos(yaw_rad) * dy) * 5
+                self._last_mouse = event.pos
+
+    def _set_camera(self):
+        glLoadIdentity()
+        pitch_rad = math.radians(self.cam_pitch)
+        yaw_rad = math.radians(self.cam_yaw)
+        cx = self.cam_target[0] + self.cam_dist * math.cos(pitch_rad) * math.cos(yaw_rad)
+        cy = self.cam_target[1] + self.cam_dist * math.sin(pitch_rad)
+        cz = self.cam_target[2] + self.cam_dist * math.cos(pitch_rad) * math.sin(yaw_rad)
+        gluLookAt(cx, cy, cz,
+                  self.cam_target[0], self.cam_target[1], self.cam_target[2],
+                  0, 1, 0)
+
+    def _draw_ground(self):
+        gs = self.GROUND_SIZE
+        step = self.GROUND_GRID_STEP
+        glBegin(GL_QUADS)
+        glColor4f(0.08, 0.08, 0.10, 0.8)
+        glVertex3f(-gs, 0, -gs)
+        glVertex3f(gs, 0, -gs)
+        glVertex3f(gs, 0, gs)
+        glVertex3f(-gs, 0, gs)
+        glEnd()
+
+        glBegin(GL_LINES)
+        glColor4f(0.15, 0.15, 0.20, 0.6)
+        v = -gs
+        while v <= gs:
+            glVertex3f(v, 0.5, -gs)
+            glVertex3f(v, 0.5, gs)
+            glVertex3f(-gs, 0.5, v)
+            glVertex3f(gs, 0.5, v)
+            v += step
+        glEnd()
+
+        glBegin(GL_LINES)
+        for r_m in range(1, 7):
+            r = r_m * 1000
+            segs = 72
+            glColor4f(0.15, 0.2, 0.15, 0.4)
+            for i in range(segs):
+                a1 = 2 * math.pi * i / segs
+                a2 = 2 * math.pi * (i + 1) / segs
+                glVertex3f(r * math.cos(a1), 1, r * math.sin(a1))
+                glVertex3f(r * math.cos(a2), 1, r * math.sin(a2))
+        glEnd()
+
+    def _draw_origin(self):
+        glPointSize(8)
+        glBegin(GL_POINTS)
+        glColor3f(1.0, 0.24, 0.24)
+        glVertex3f(0, 2, 0)
+        glEnd()
+
+        glBegin(GL_LINES)
+        glColor3f(1.0, 0.3, 0.3)
+        glVertex3f(0, 0, 0)
+        glVertex3f(0, self.WALL_HEIGHT * 1.5, 0)
+        glEnd()
+
+    def render(self, scan_data, max_range_m, show_walls):
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+        self._set_camera()
+        self._draw_ground()
+        self._draw_origin()
+
+        max_range_mm = max_range_m * 1000
+        screen_points = []
+
+        for i in range(SCAN_SIZE):
+            if scan_data[i] is None:
+                continue
+            distance, quality, age = scan_data[i]
+            if distance > max_range_mm:
+                continue
+            angle_deg = i / 2.0
+            rad = math.radians(angle_deg)
+            x = distance * math.cos(rad)
+            z = distance * math.sin(rad)
+            screen_points.append((x, z, age, i, distance))
+
+        if not screen_points:
+            return
+
+        glPointSize(4)
+        glBegin(GL_POINTS)
+        for x, z, age, idx, d in screen_points:
+            if age == 0:
+                glColor3f(0.0, 1.0, 0.4)
+            elif age == 1:
+                glColor3f(0.0, 0.86, 0.31)
+            else:
+                glColor3f(0.0, 0.4, 0.2)
+            glVertex3f(x, 2, z)
+        glEnd()
+
+        if show_walls and len(screen_points) >= 2:
+            sorted_pts = sorted(screen_points, key=lambda p: p[3])
+            wall_h = self.WALL_HEIGHT
+
+            for j in range(1, len(sorted_pts)):
+                x1, z1, age1, idx1, d1 = sorted_pts[j - 1]
+                x2, z2, age2, idx2, d2 = sorted_pts[j]
+
+                angle_gap = idx2 - idx1
+                if angle_gap > 10:
+                    continue
+
+                dx = x2 - x1
+                dz = z2 - z1
+                dist_2d = math.sqrt(dx * dx + dz * dz)
+                max_gap = max(100, 500 * (1.0 / max(0.1, max_range_m / 6.0)))
+                if dist_2d > max_gap:
+                    continue
+
+                max_age = max(age1, age2)
+                if max_age == 0:
+                    r, g, b = 0.0, 0.9, 0.4
+                elif max_age == 1:
+                    r, g, b = 0.0, 0.65, 0.3
+                else:
+                    r, g, b = 0.0, 0.4, 0.18
+
+                glBegin(GL_QUADS)
+                glColor4f(r, g, b, 0.5)
+                glVertex3f(x1, 0, z1)
+                glVertex3f(x2, 0, z2)
+                glColor4f(r, g, b, 0.8)
+                glVertex3f(x2, wall_h, z2)
+                glVertex3f(x1, wall_h, z1)
+                glEnd()
+
+                glBegin(GL_LINE_LOOP)
+                glColor4f(r, g, b, 1.0)
+                glVertex3f(x1, 0, z1)
+                glVertex3f(x2, 0, z2)
+                glVertex3f(x2, wall_h, z2)
+                glVertex3f(x1, wall_h, z1)
+                glEnd()
+
+            glBegin(GL_LINES)
+            glColor4f(0.0, 1.0, 0.4, 0.6)
+            for j in range(1, len(sorted_pts)):
+                x1, z1, _, idx1, _ = sorted_pts[j - 1]
+                x2, z2, _, idx2, _ = sorted_pts[j]
+                if idx2 - idx1 > 10:
+                    continue
+                dx = x2 - x1
+                dz = z2 - z1
+                if math.sqrt(dx*dx + dz*dz) > max_gap:
+                    continue
+                glVertex3f(x1, wall_h, z1)
+                glVertex3f(x2, wall_h, z2)
+            glEnd()
+
+
 class LidarMap:
     def __init__(self):
         pygame.init()
@@ -172,6 +400,8 @@ class LidarMap:
         self.show_walls = True
         self.show_grid = True
         self.fullscreen = False
+        self.mode_3d = False
+        self.view_3d = Lidar3DView(self.width, self.height) if HAS_OPENGL else None
         
         self.lidar = None
         self.port_name = ""
@@ -350,7 +580,8 @@ class LidarMap:
         
         help_y = self.height - 24
         pygame.draw.rect(self.screen, (20, 20, 28), (0, help_y - 4, self.width, 28))
-        help_text = f"Range: {self.max_range_m}m  │  +/- Zoom  │  W Walls: {'ON' if self.show_walls else 'OFF'}  │  G Grid  │  R Reset  │  F Fullscreen  │  ESC Quit"
+        mode_hint = "  │  3 → 3D View" if HAS_OPENGL else ""
+        help_text = f"Range: {self.max_range_m}m  │  +/- Zoom  │  W Walls: {'ON' if self.show_walls else 'OFF'}  │  G Grid  │  R Reset  │  F Fullscreen{mode_hint}  │  ESC Quit"
         help_surf = self.font_small.render(help_text, True, (100, 100, 120))
         self.screen.blit(help_surf, (12, help_y))
     
@@ -383,6 +614,26 @@ class LidarMap:
             text = self.font_small.render(label, True, (140, 140, 150))
             self.screen.blit(text, (lx + 28, y - 2))
     
+    def _switch_to_3d(self):
+        if not HAS_OPENGL or not self.view_3d:
+            return
+        self.mode_3d = True
+        flags = DOUBLEBUF | OPENGL
+        if self.fullscreen:
+            flags |= FULLSCREEN
+        self.screen = pygame.display.set_mode((self.width, self.height), flags)
+        self.view_3d.init_gl(self.width, self.height)
+        pygame.display.set_caption("MB-1R2T LiDAR Map [3D]")
+
+    def _switch_to_2d(self):
+        self.mode_3d = False
+        flags = RESIZABLE
+        if self.fullscreen:
+            flags = FULLSCREEN
+        self.screen = pygame.display.set_mode((self.width, self.height), flags)
+        self._update_zoom()
+        pygame.display.set_caption("MB-1R2T LiDAR Map")
+
     def run(self):
         running = True
         self._update_zoom()
@@ -395,6 +646,10 @@ class LidarMap:
                 elif event.type == pygame.KEYDOWN:
                     if event.key in (pygame.K_ESCAPE, pygame.K_q):
                         running = False
+                    elif event.key == pygame.K_3 and HAS_OPENGL and not self.mode_3d:
+                        self._switch_to_3d()
+                    elif event.key == pygame.K_2 and self.mode_3d:
+                        self._switch_to_2d()
                     elif event.key == pygame.K_PLUS or event.key == pygame.K_EQUALS:
                         self.max_range_m = max(1, self.max_range_m - 1)
                         self._update_zoom()
@@ -408,33 +663,55 @@ class LidarMap:
                     elif event.key == pygame.K_r:
                         self.scan_data = [None] * SCAN_SIZE
                         self.scan_count = 0
+                        if self.mode_3d and self.view_3d:
+                            self.view_3d.cam_dist = 8000.0
+                            self.view_3d.cam_pitch = 35.0
+                            self.view_3d.cam_yaw = 45.0
+                            self.view_3d.cam_target = [0.0, 0.0, 0.0]
                     elif event.key == pygame.K_f:
                         self.fullscreen = not self.fullscreen
                         if self.fullscreen:
-                            self.screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+                            flags = FULLSCREEN
+                            if self.mode_3d:
+                                flags |= DOUBLEBUF | OPENGL
+                            self.screen = pygame.display.set_mode((0, 0), flags)
                             info = pygame.display.Info()
                             self.width = info.current_w
                             self.height = info.current_h
                         else:
                             self.width, self.height = 1200, 900
+                            flags = RESIZABLE
+                            if self.mode_3d:
+                                flags = DOUBLEBUF | OPENGL
                             self.screen = pygame.display.set_mode(
-                                (self.width, self.height), pygame.RESIZABLE)
+                                (self.width, self.height), flags)
                         self._update_zoom()
+                        if self.mode_3d and self.view_3d:
+                            self.view_3d.init_gl(self.width, self.height)
                 
                 elif event.type == pygame.VIDEORESIZE:
                     self.width, self.height = event.w, event.h
                     self._update_zoom()
+                    if self.mode_3d and self.view_3d:
+                        self.view_3d._setup_projection()
+                
+                if self.mode_3d and self.view_3d:
+                    self.view_3d.handle_event(event)
             
             self._process_data()
             
-            self.screen.fill(BG_COLOR)
-            self._draw_grid()
-            self._draw_sweep_line()
-            self._draw_scan()
-            self._draw_hud()
-            self._draw_legend()
+            if self.mode_3d and self.view_3d:
+                self.view_3d.render(self.scan_data, self.max_range_m, self.show_walls)
+                pygame.display.flip()
+            else:
+                self.screen.fill(BG_COLOR)
+                self._draw_grid()
+                self._draw_sweep_line()
+                self._draw_scan()
+                self._draw_hud()
+                self._draw_legend()
+                pygame.display.flip()
             
-            pygame.display.flip()
             self.clock.tick(60)
         
         if self.lidar:

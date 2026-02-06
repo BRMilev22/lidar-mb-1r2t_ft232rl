@@ -1,5 +1,16 @@
 # Technical Documentation
 
+<p align="center">
+  <img src="radar_logo.png" alt="LiDAR Map Logo" width="200">
+</p>
+
+<p align="center">
+  <em>Real-time 2D & 3D LiDAR visualization for the MB-1R2T sensor</em><br>
+  <sub>Logo by <a href="https://github.com/PRPetkov22">PRPetkov22</a></sub>
+</p>
+
+---
+
 ## LiDAR Connector Pinout
 
 ![LiDAR Pinout](https://github.com/pav2000/LidarStm32f103/blob/main/lidar.jpg?raw=true)
@@ -21,7 +32,9 @@
 9. [Signal Quality & Filtering](#signal-quality--filtering)
 10. [Timing & Data Rates](#timing--data-rates)
 11. [Software Implementation](#software-implementation)
-12. [Troubleshooting](#troubleshooting)
+12. [2D Visualization Mode](#2d-visualization-mode)
+13. [3D Visualization Mode](#3d-visualization-mode)
+14. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -672,84 +685,395 @@ Each packet (▓▓):
 
 ## Software Implementation
 
-The visualizer (`lidar_map.py`) uses **Pygame** for real-time rendering. Previous attempts
-with PyQtGraph/OpenGL had performance issues (freezing, buffer overflows) and the line
-rendering created "spider-web" artifacts connecting distant points through the center.
+The visualizer (`lidar_map.py`) is the heart of this project — a real-time LiDAR display application
+built with **Pygame** and **PyOpenGL** that supports both a top-down **2D radar view** and an
+immersive **3D perspective view** with extruded walls. The application runs at 60 FPS and is
+designed for cross-platform use on macOS, Windows, and Linux.
+
+### Development History
+
+The current visualizer is the result of extensive iteration:
+
+1. **Matplotlib** — First attempt, froze under real-time data load
+2. **PyQtGraph + PyQt6** — Buffer overflows, crashes after 10 seconds
+3. **PyQtGraph + PyOpenGL** — "Spider-web" line artifacts connecting distant points through center
+4. **Pygame (current)** — Stable, performant, no artifacts
+
+The critical breakthrough was discovering that the sensor **interleaves invalid sentinel readings**
+(quality=1, distance=64000-65240mm) between valid data. Once proper filtering was applied
+(`quality >= 10`, `distance < 16000mm`), the visualization became clean and accurate.
 
 ### Architecture
 
 ```
-+-------------------------------------------------------+
-|  lidar_map.py                                         |
-|                                                       |
-|  +-------------+     +-----------------------------+  |
-|  | LidarSerial  |---->| LidarMap (Pygame renderer)  |  |
-|  |              |     |                             |  |
-|  | - Serial I/O |     | - 720-slot scan buffer      |  |
-|  | - Packet     |     | - Grid overlay              |  |
-|  |   parsing    |     | - Wall segment detection    |  |
-|  | - Buffer     |     | - Sweep line animation      |  |
-|  |   management |     | - HUD with live stats       |  |
-|  +-------------+     +-----------------------------+  |
-+-------------------------------------------------------+
++------------------------------------------------------------------+
+|  lidar_map.py                                                    |
+|                                                                  |
+|  +-------------+     +-----------------------------+             |
+|  | LidarSerial  |---->| LidarMap (main controller)  |             |
+|  |              |     |                             |             |
+|  | - Serial I/O |     | - 720-slot scan buffer      |             |
+|  | - Packet     |     | - Event loop & input        |             |
+|  |   parsing    |     | - Mode switching (2D/3D)     |             |
+|  | - Buffer     |     +--------+--------------------+             |
+|  |   management |              |                                  |
+|  +-------------+     +--------v--------+   +--------v--------+   |
+|                      | 2D Renderer     |   | Lidar3DView     |   |
+|                      | (Pygame 2D)     |   | (OpenGL 3D)     |   |
+|                      |                 |   |                 |   |
+|                      | - Grid overlay  |   | - Ground plane  |   |
+|                      | - Point drawing |   | - Extruded walls|   |
+|                      | - Wall segments |   | - Orbit camera  |   |
+|                      | - Sweep line    |   | - Range rings   |   |
+|                      | - HUD + Legend  |   | - Mouse control |   |
+|                      +-----------------+   +-----------------+   |
++------------------------------------------------------------------+
 ```
 
 ### Dependencies
 
-```
-pyserial    - Serial port communication
-pygame      - Real-time 2D rendering at 60 FPS
-```
+| Package | Purpose | Required |
+|---------|---------|----------|
+| `pyserial` | Serial port communication with LiDAR | Yes |
+| `pygame` | Window management, 2D rendering, event loop | Yes |
+| `PyOpenGL` | OpenGL bindings for 3D visualization | Optional (3D mode) |
+| `numpy` | Numerical operations | Optional |
+
+If PyOpenGL is not installed, the application gracefully falls back to 2D-only mode.
 
 ### Scan Buffer Design
 
-The scan buffer uses a 720-slot array (0.5 degree resolution per slot) that stores the
-latest measurement for each angle:
+The scan buffer is the core data structure shared between both 2D and 3D renderers. It uses
+a 720-slot array (0.5° resolution per slot) that stores the latest measurement for each angle:
 
 ```python
 SCAN_SIZE = 720
 scan_data = [None] * SCAN_SIZE
 
-idx = int(angle * 2) % SCAN_SIZE  # 45.5 degrees -> slot 91
+idx = int(angle * 2) % SCAN_SIZE  # 45.5° -> slot 91
+scan_data[idx] = (distance_mm, quality, age)
 ```
 
 Each slot stores a tuple of `(distance_mm, quality, age)` where `age` tracks how many
 full rotations old the reading is. Points older than 3 scans are discarded, ensuring
 the display always reflects current surroundings.
 
-### Wall Segment Detection
+Full-rotation detection uses angle wraparound:
 
-Walls are drawn by connecting adjacent points that are physically close to each other.
-The algorithm uses **pixel-space distance** to determine connectivity:
+```python
+if angle < 30 and self.last_angle > 330:
+    self.scan_count += 1
+    # Age all existing points, discard points older than POINT_FADE_SCANS
+```
+
+### Keyboard Controls
+
+| Key | Action | Mode |
+|-----|--------|------|
+| `2` | Switch to 2D view | 3D → 2D |
+| `3` | Switch to 3D view | 2D → 3D |
+| `+` / `=` | Zoom in (decrease range) | Both |
+| `-` | Zoom out (increase range) | Both |
+| `W` | Toggle wall rendering | Both |
+| `G` | Toggle grid overlay | 2D only |
+| `R` | Reset scan data & camera | Both |
+| `F` | Toggle fullscreen | Both |
+| `ESC` / `Q` | Quit | Both |
+
+### Mouse Controls (3D Mode)
+
+| Input | Action |
+|-------|--------|
+| Left-click + drag | Orbit camera (yaw/pitch) |
+| Right-click + drag | Pan camera target |
+| Scroll wheel up | Zoom in (decrease camera distance) |
+| Scroll wheel down | Zoom out (increase camera distance) |
+
+---
+
+## 2D Visualization Mode
+
+The 2D mode presents a classic **top-down radar view** — a polar-coordinate display where the
+LiDAR sensor sits at the center and detected objects appear as points at their measured
+angle and distance. This is the default view when the application starts.
+
+### Display Components
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  ● LiDAR Map    Connected: usbserial-A506...  │ 342 pts│
+├─────────────────────────────────────────────────────┬───┤
+│                                                     │ L │
+│            ·   · ·                                  │ E │
+│          ·         ·                                │ G │
+│        ·     ┼───── sweep line                      │ E │
+│          ·         ·                                │ N │
+│            · · · ·                                  │ D │
+│         range rings (1m, 2m, 3m...)                 │   │
+│                                                     │   │
+├─────────────────────────────────────────────────────┴───┤
+│  Range: 6m │ +/- Zoom │ W Walls: ON │ 3 → 3D │ ESC     │
+└─────────────────────────────────────────────────────────┘
+```
+
+#### Grid Overlay
+
+The grid is rendered as concentric circles representing distance from the sensor, with
+radial lines every 45° for angular reference. Each ring is labeled with its distance in
+meters. The grid adapts to zoom level — as range changes, circles scale accordingly.
+
+#### Point Rendering
+
+Each valid scan point is drawn as a colored circle whose color indicates freshness:
+
+| Age | Color | Size | Meaning |
+|-----|-------|------|---------|
+| 0 (current scan) | Bright green `(0, 255, 100)` | 4px | Just measured |
+| 1 scan old | Medium green `(0, 220, 80)` | 3px | Previous rotation |
+| 2-3 scans old | Dark green `(0, 100, 50)` | 2px | Fading out |
+| >3 scans old | — | — | Automatically removed |
+
+This aging system provides a "phosphor decay" effect similar to classic radar displays,
+giving a sense of temporal persistence while keeping the display current.
+
+#### Point-to-Screen Coordinate Mapping
+
+Polar coordinates from the LiDAR (angle, distance) are converted to Cartesian screen
+coordinates:
+
+```python
+def _angle_to_xy(self, angle_deg, distance_mm):
+    rad = math.radians(angle_deg)
+    x = distance_mm * math.cos(rad)
+    y = distance_mm * math.sin(rad)
+    return x, y
+
+def _world_to_screen(self, x_mm, y_mm):
+    sx = center_x + int(x_mm * self.zoom)
+    sy = center_y - int(y_mm * self.zoom)  # Y flipped for screen coords
+    return sx, sy
+```
+
+The `zoom` factor is calculated to fill the window:
+
+```python
+usable = min(center_x, center_y) - 40  # 40px margin
+self.zoom = usable / (max_range_m * 1000)
+```
+
+#### Wall Segment Detection
+
+Walls are drawn by connecting adjacent scan points that are physically close to each other.
+The algorithm uses **pixel-space distance** rather than world-space distance, which naturally
+adapts to zoom level and prevents false connections:
 
 ```python
 for j in range(1, len(screen_points)):
     sx1, sy1, _, idx1, _ = screen_points[j - 1]
     sx2, sy2, _, idx2, _ = screen_points[j]
 
-    if idx2 - idx1 > 10:  # angle gap > 5 degrees -> break
+    # Skip if angle gap too large (> 5°)
+    if idx2 - idx1 > 10:
         continue
 
+    # Check pixel-space proximity
     pixel_dist = math.sqrt((sx2-sx1)**2 + (sy2-sy1)**2)
     if pixel_dist < max(30, 150 * zoom):
         pygame.draw.line(screen, wall_color, (sx1,sy1), (sx2,sy2), 2)
 ```
 
-This prevents the "spider-web" effect that occurred when connecting points by angle
-alone — two points at adjacent angles but vastly different distances would create
-lines through the center of the display.
+This prevents the **"spider-web" effect** — the critical rendering bug found in earlier
+versions. When connecting points by angle order alone, two points at adjacent angles but
+vastly different distances (e.g., one hitting a near wall, the next passing through a
+doorway to hit a far wall) would generate lines passing straight through the center of
+the display, creating a web-like pattern of false walls.
 
-### Keyboard Controls
+#### Sweep Line
 
-| Key | Action |
-|-----|--------|
-| `+` / `=` | Zoom in (decrease range) |
-| `-` | Zoom out (increase range) |
-| `W` | Toggle wall rendering |
-| `G` | Toggle grid overlay |
-| `R` | Reset / clear scan data |
-| `F` | Toggle fullscreen |
-| `ESC` / `Q` | Quit |
+A faint green line from the center to the edge at the current scan angle provides visual
+feedback that the sensor is actively scanning. It rotates with the LiDAR motor.
+
+#### HUD (Head-Up Display)
+
+The top bar shows:
+- Connection status (green = connected, red = disconnected)
+- Serial port name
+- Number of active points in the scan buffer
+- Points received per second
+- Total packet count
+- Current scan revolution number
+
+The bottom bar shows available keyboard shortcuts and current settings.
+
+#### Legend
+
+A semi-transparent overlay in the top-right corner explains the color coding:
+- Fresh point, 1-scan old, 2-3 scans old
+- Wall segment, LiDAR origin, sweep line
+
+### When to Use 2D Mode
+
+- **Mapping rooms and spaces** — top-down is the natural perspective
+- **Verifying sensor alignment** — easily spot if the sensor is tilted
+- **Measuring distances** — grid rings give direct distance readings
+- **Quick inspection** — lower computational cost, runs well on any hardware
+- **HUD information** — full statistics are only shown in 2D mode
+
+---
+
+## 3D Visualization Mode
+
+The 3D mode transforms the flat 2D scan data into an immersive **perspective view** with
+extruded walls, a ground plane, and a freely orbiting camera. It uses **PyOpenGL** to
+render the scene via OpenGL, providing a sense of physical space that the 2D view cannot.
+
+Press `3` to enter 3D mode, and `2` to return to 2D.
+
+### How 3D is Constructed from 2D Data
+
+The MB-1R2T is a **2D LiDAR** — it scans in a single horizontal plane. The 3D view creates
+an illusion of a 3D environment by **extruding** the 2D scan points vertically:
+
+```
+2D scan data (top-down):          3D extruded result:
+
+   · · · · ·                        ┌─────────────┐
+  ·           ·                     │             │
+ ·             ·                    │   Wall      │  ← WALL_HEIGHT
+  ·           ·                     │   (200mm)   │
+   · · · · ·                        └─────────────┘
+                                    ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓  ← ground plane
+```
+
+For each pair of adjacent scan points that form a wall segment (using the same proximity
+algorithm as 2D mode), a **quad** (rectangle) is drawn from the ground (y=0) up to
+`WALL_HEIGHT` (200 units). This creates solid wall panels.
+
+### OpenGL Rendering Pipeline
+
+The 3D renderer (`Lidar3DView` class) uses OpenGL's fixed-function pipeline:
+
+1. **Clear** — Clear color and depth buffers
+2. **Camera setup** — Position the camera using `gluLookAt`
+3. **Ground plane** — Large quad at y=0 with grid lines
+4. **Range rings** — Concentric circles on the ground (1m intervals)
+5. **Origin marker** — Red point and vertical line at sensor position
+6. **Scan points** — Colored dots at ground level
+7. **Wall quads** — Semi-transparent extruded rectangles between adjacent points
+8. **Wall top edges** — Bright lines along the top of walls for clarity
+
+### Camera System
+
+The 3D camera uses a **spherical orbit model** centered on an adjustable target point:
+
+```python
+cam_dist  = 8000.0   # distance from target (zoom)
+cam_pitch = 35.0     # vertical angle (5° – 85°)
+cam_yaw   = 45.0     # horizontal angle (unlimited rotation)
+cam_target = [0, 0, 0]  # look-at point (pannable)
+```
+
+Camera position is calculated from spherical coordinates:
+
+```python
+cx = target_x + dist * cos(pitch) * cos(yaw)
+cy = target_y + dist * sin(pitch)           # height
+cz = target_z + dist * cos(pitch) * sin(yaw)
+```
+
+This gives natural "orbit around the scene" behavior with mouse dragging.
+
+### Ground Plane & Grid
+
+The ground plane extends 15 meters in each direction from the origin. It features:
+
+- **Base quad** — Dark semi-transparent surface at y=0
+- **Grid lines** — Every 1 meter for scale reference
+- **Range rings** — Concentric circles at 1m intervals (matching the 2D grid)
+
+### Wall Extrusion Algorithm
+
+The wall rendering uses the same adjacency logic as the 2D wall segments, but instead of
+drawing lines, it creates 3D geometry:
+
+```python
+# For each pair of adjacent points that pass the proximity test:
+glBegin(GL_QUADS)
+  # Bottom edge (at ground level)
+  glVertex3f(x1, 0, z1)
+  glVertex3f(x2, 0, z2)
+  # Top edge (at wall height)
+  glVertex3f(x2, WALL_HEIGHT, z2)
+  glVertex3f(x1, WALL_HEIGHT, z1)
+glEnd()
+```
+
+Walls use alpha transparency (`0.5` fill, `1.0` outline) so overlapping walls remain
+visible. The top edge is highlighted with a separate bright line for definition.
+
+### Wall Color by Age
+
+| Point Age | Wall Fill Color | Meaning |
+|-----------|----------------|----------|
+| 0 (current) | `(0, 0.9, 0.4, 0.5)` | Freshly scanned wall |
+| 1 scan old | `(0, 0.65, 0.3, 0.5)` | Recent wall |
+| 2+ scans old | `(0, 0.4, 0.18, 0.5)` | Aging wall |
+
+### OpenGL Features Used
+
+| Feature | Purpose |
+|---------|----------|
+| `GL_DEPTH_TEST` | Correct occlusion of walls behind other walls |
+| `GL_BLEND` | Semi-transparent wall panels |
+| `GL_LINE_SMOOTH` | Anti-aliased edges on wall outlines |
+| `gluPerspective` | 50° field-of-view perspective projection |
+| `gluLookAt` | Spherical orbit camera positioning |
+
+### Coordinate System
+
+The 3D view uses a Y-up coordinate system:
+
+```
+        Y (up)
+        │
+        │
+        │
+        └──────── X (right)
+       /
+      /
+     Z (forward)
+```
+
+- **X, Z** — Horizontal plane (maps to LiDAR's angle + distance)
+- **Y** — Vertical axis (walls extend from 0 to WALL_HEIGHT)
+- Scan points sit at Y=2 (slightly above ground to prevent z-fighting)
+
+### Performance Considerations
+
+The 3D mode uses OpenGL's immediate mode (`glBegin`/`glEnd`) for simplicity. For up to
+720 points per scan, this is more than adequate at 60 FPS. The main bottleneck is the
+serial data rate, not rendering.
+
+### When to Use 3D Mode
+
+- **Spatial understanding** — Get an intuitive feel for the room layout
+- **Presentations and demos** — More visually impressive than top-down
+- **Verifying wall detection** — See if walls look like solid surfaces
+- **Exploring from different angles** — Orbit to find blind spots or reflections
+- **Understanding sensor limitations** — See where the single-plane scan ends
+
+### Limitations of 3D from 2D Data
+
+Since the MB-1R2T is a 2D sensor scanning in a single horizontal plane:
+
+- **No vertical information** — Objects above or below the scan plane are invisible
+- **Fixed wall height** — All walls appear the same height (200 units)
+- **No ceiling/floor** — Only the artificial ground plane exists
+- **Thin objects** — Objects thinner than the scan resolution (~0.5°) may be missed
+- **Glass and mirrors** — May cause phantom reflections or pass-through
+
+Despite these limitations, the 3D view provides a much more intuitive understanding of
+the scanned environment than raw numbers or even the 2D top-down view.
 
 ---
 
